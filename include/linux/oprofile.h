@@ -195,6 +195,22 @@ int oprofile_add_data(struct op_entry *entry, unsigned long val);
 int oprofile_add_data64(struct op_entry *entry, u64 val);
 int oprofile_write_commit(struct op_entry *entry);
 
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+extern int measuring_IPS_type_started;
+extern DEFINE_PER_CPU(int, pmu_ovf_lock); /* while pmu_ovf_lock is 1, do not treat overflow */
+/* machine specific functions */
+int do_start_measuring_IPS_type(void);
+int do_stop_measuring_IPS_type(void);
+void update_cpu_IPS_type(void *__not_in_cs);
+void update_IPS_type(void);
+/*
+event:0xc0 counters:0,1,2,3 um:zero minimum:3000 name:RETIRED_INSTRUCTIONS : Retired instructions (includes exceptions, interrupts, re-syncs)
+*/
+#define M_INST_THRESHOLD 1000000000ULL /* 1 biliion */
+#define M_INST_EVENT 0xc0
+#define M_INST_UNIT_MASK 0x0
+#endif /* CONFIG_FAIRAMP_MEASURING_IPS */
+
 #ifdef CONFIG_HW_PERF_EVENTS
 int __init oprofile_perf_init(struct oprofile_operations *ops);
 void oprofile_perf_exit(void);

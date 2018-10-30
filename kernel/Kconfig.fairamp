@@ -1,0 +1,45 @@
+config FAIRAMP
+	bool "Fairness-oriented scheduling for asymmetric multi-cores (FAIRAMP)"
+	default y
+	depends on SMP
+	help
+	  sys_fairamp, do_get_threads_info, cpu_topology
+
+config FAIRAMP_DO_SCHED
+	bool "FAIRAMP really DO the scheduling"
+	default y
+	depends on FAIRAMP
+	help
+	  fast/slow [unit] vruntime, fast/slow round, really do the frequent migrations
+
+config FAIRAMP_FAST_CORE_FIRST
+	bool "FAIRAMP use fast-core-first policy"
+	default y
+	depends on FAIRAMP_DO_SCHED
+	help
+	  FAIRAMP use fast-core-first policy.
+	  If there are idle fast cores, fast cores pull tasks from slow cores.
+
+config FAIRAMP_MEASURING_IPS
+	bool "FAIRAMP measures instruction per seconds"
+	default y
+	depends on FAIRAMP && ARCH = "x86_64" && X86_LOCAL_APIC
+	select OPROFILE
+	help
+	  Using performance counters, measure instruction per seconds
+	  Currently only work in x86 architecture.
+
+config FAIRAMP_DEBUG
+	bool "FAIRAMP debug mode"
+	default n
+	depends on FAIRAMP
+	help
+	  Print debug messages to kernel log
+
+config FAIRAMP_STAT
+	bool "FAIRAMP statistics"
+	default y
+	depends on FAIRAMP_DO_SCHED && SCHEDSTATS && SCHED_DEBUG
+	help
+	  Gather variety of fairamp statistics for debug
+	  /proc/sched_debug show the statistics

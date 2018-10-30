@@ -204,8 +204,15 @@ static void account_kernel_stack(struct thread_info *ti, int account)
 	mod_zone_page_state(zone, NR_KERNEL_STACK, account);
 }
 
+#ifdef CONFIG_FAIRAMP
+void dealloc_fairamp_tasks(struct task_struct *); /* defined in kernel/sched/fair.c */
+#endif
+
 void free_task(struct task_struct *tsk)
 {
+#ifdef CONFIG_FAIRAMP
+	dealloc_fairamp_tasks(tsk);
+#endif
 	account_kernel_stack(tsk->stack, -1);
 	arch_release_thread_info(tsk->stack);
 	free_thread_info(tsk->stack);

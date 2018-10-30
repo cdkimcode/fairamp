@@ -1141,6 +1141,22 @@ struct sched_entity {
 	u64			sum_exec_runtime;
 	u64			vruntime;
 	u64			prev_sum_exec_runtime;
+#ifdef CONFIG_FAIRAMP
+	u64			sum_fast_exec_runtime; /* for statistics, also used for measuring IPS */
+	u64			sum_slow_exec_runtime; /* for statistics, also used for measuring IPS */
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+	u64			fast_vruntime; /* to schedule */
+	u64			slow_vruntime; /* to schedule */
+	u64			unit_fast_vruntime;
+	u64			unit_slow_vruntime;
+	u64			fast_round; /* (fast_vruntime / unit_fast_vruntime) */
+	u64			slow_round; /* (slow_vruntime / slow_vruntime) */
+	int			lagged;     /* basically, fast_round - slow_round. If only one of unit_vruntime == 0, INT_MAX or INT_MIN */
+#endif
+
+	u64			sum_fast_exec_runtime_mprev; /* for measuring IPS, or just for statistics */
+	u64			sum_slow_exec_runtime_mprev; /* for measuring IPS, or just for statistics */
+#endif /* CONFIG_FAIRAMP */
 
 	u64			nr_migrations;
 
@@ -1225,6 +1241,14 @@ struct task_struct {
 	unsigned char fpu_counter;
 #ifdef CONFIG_BLK_DEV_IO_TRACE
 	unsigned int btrace_seq;
+#endif
+
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+	/* to measure IPS for each type */
+	atomic64_t insts_fast;
+	atomic_t insts_fast_ovf;
+	atomic64_t insts_slow;
+	atomic_t insts_slow_ovf;
 #endif
 
 	unsigned int policy;
@@ -1954,6 +1978,9 @@ static inline void disable_sched_clock_irqtime(void) {}
 
 extern unsigned long long
 task_sched_runtime(struct task_struct *task);
+#ifdef CONFIG_FAIRAMP
+extern void update_cpu_time_type(void *dummy);
+#endif
 
 /* sched_exec is called by processes performing an exec */
 #ifdef CONFIG_SMP

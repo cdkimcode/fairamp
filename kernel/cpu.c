@@ -678,6 +678,12 @@ static DECLARE_BITMAP(cpu_active_bits, CONFIG_NR_CPUS) __read_mostly;
 const struct cpumask *const cpu_active_mask = to_cpumask(cpu_active_bits);
 EXPORT_SYMBOL(cpu_active_mask);
 
+#ifdef CONFIG_FAIRAMP
+static DECLARE_BITMAP(cpu_fast_bits, CONFIG_NR_CPUS) __read_mostly;
+const struct cpumask *const cpu_fast_mask = to_cpumask(cpu_fast_bits);
+EXPORT_SYMBOL(cpu_fast_mask);
+#endif
+
 void set_cpu_possible(unsigned int cpu, bool possible)
 {
 	if (possible)
@@ -709,6 +715,21 @@ void set_cpu_active(unsigned int cpu, bool active)
 	else
 		cpumask_clear_cpu(cpu, to_cpumask(cpu_active_bits));
 }
+
+#ifdef CONFIG_FAIRAMP
+void set_cpu_fast(unsigned int cpu, bool fast)
+{
+	if (fast)
+		cpumask_set_cpu(cpu, to_cpumask(cpu_fast_bits));
+	else
+		cpumask_clear_cpu(cpu, to_cpumask(cpu_fast_bits));
+}
+
+void set_cpu_slow(unsigned int cpu, bool slow)
+{
+	set_cpu_fast(cpu, !slow);
+}
+#endif
 
 void init_cpu_present(const struct cpumask *src)
 {

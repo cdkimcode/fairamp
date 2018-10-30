@@ -124,10 +124,30 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
 		(long long)(p->nvcsw + p->nivcsw),
 		p->prio);
 #ifdef CONFIG_SCHEDSTATS
-	SEQ_printf(m, "%9Ld.%06ld %9Ld.%06ld %9Ld.%06ld",
-		SPLIT_NS(p->se.vruntime),
-		SPLIT_NS(p->se.sum_exec_runtime),
-		SPLIT_NS(p->se.statistics.sum_sleep_runtime));
+	SEQ_printf(m, "%9Ld.%06ld %9Ld.%06ld %9Ld.%06ld" 
+#ifdef CONFIG_FAIRAMP
+		" %9Ld.%06ld %9Ld.%06ld"
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+		" %9Ld.%06ld %9Ld.%06ld %10Ld %10Ld %10Ld %10Ld %6d"
+#endif
+#endif
+		,SPLIT_NS(p->se.vruntime)
+ 		,SPLIT_NS(p->se.sum_exec_runtime)
+		,SPLIT_NS(p->se.statistics.sum_sleep_runtime)
+#ifdef CONFIG_FAIRAMP
+		,SPLIT_NS(p->se.sum_fast_exec_runtime)
+		,SPLIT_NS(p->se.sum_slow_exec_runtime)
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+		,SPLIT_NS(p->se.fast_vruntime)
+		,SPLIT_NS(p->se.slow_vruntime)
+		,(long long)p->se.unit_fast_vruntime
+		,(long long)p->se.unit_slow_vruntime
+		,(long long)p->se.fast_round
+		,(long long)p->se.slow_round
+		,p->se.lagged
+#endif
+#endif
+		);
 #else
 	SEQ_printf(m, "%15Ld %15Ld %15Ld.%06ld %15Ld.%06ld %15Ld.%06ld",
 		0LL, 0LL, 0LL, 0L, 0LL, 0L, 0LL, 0L);
@@ -147,7 +167,15 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 	SEQ_printf(m,
 	"\nrunnable tasks:\n"
 	"            task   PID         tree-key  switches  prio"
-	"     exec-runtime         sum-exec        sum-sleep\n"
+	"     exec-runtime         sum-exec        sum-sleep"
+#ifdef CONFIG_FAIRAMP
+	"    fast_sum_exec    slow_sum_exec"
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+	"    fast-vruntime    slow-vruntime"
+	" fast_unit  slow_unit fast_round slow_round lagged"
+#endif
+#endif
+	"\n"
 	"------------------------------------------------------"
 	"----------------------------------------------------\n");
 
@@ -253,11 +281,20 @@ static void print_cpu(struct seq_file *m, int cpu)
 	{
 		unsigned int freq = cpu_khz ? : 1;
 
-		SEQ_printf(m, "\ncpu#%d, %u.%03u MHz\n",
-			   cpu, freq / 1000, (freq % 1000));
+#ifndef CONFIG_FAIRAMP
+ 		SEQ_printf(m, "cpu#%d, %u.%03u MHz\n",
+ 			   cpu, freq / 1000, (freq % 1000));
+#else
+		SEQ_printf(m, "cpu#%d (%s), %u.%03u MHz\n",
+			   cpu, rq->is_fast ? "fast" : "slow", freq / 1000, (freq % 1000));
+#endif
 	}
 #else
-	SEQ_printf(m, "\ncpu#%d\n", cpu);
+#ifndef CONFIG_FAIRAMP
+ 	SEQ_printf(m, "cpu#%d\n", cpu);
+#else
+	SEQ_printf(m, "cpu#%d (%s)\n", cpu, rq->is_fast ? "fast" : "slow");
+#endif
 #endif
 
 #define P(x)								\
@@ -302,6 +339,61 @@ do {									\
 
 	P(ttwu_count);
 	P(ttwu_local);
+
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+	P(max_lagged);
+	if (rq->max_lagged_task) {
+		P(max_lagged_task->pid);
+	} else {
+		SEQ_printf(m, "  .%-30s: %s\n", "max_lagged_task->pid", "NULL");
+	}
+#endif
+
+#ifdef CONFIG_FAIRAMP_STAT
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+	P(fairamp_balance_called);
+	P(fairamp_balance_no_candidate);
+	P(fairamp_balance_that_rq_is_balancing);
+	P(fairamp_balance_task_lost_double_checking);
+	P(fairamp_balance_cannot_migrate_task_double_checking);
+	P(fairamp_balance_task_running_double_checking);
+	P(fairamp_balance_this_to_that_passive);
+	P(fairamp_balance_this_to_that_active);
+	P(fairamp_balance_that_to_this_passive);
+	P(fairamp_balance_that_to_this_active);
+	P(fairamp_balance_failed);
+
+	/* related to fairamp_balance_cpu_stop */
+	P(fairamp_balance_cpu_stop_called);
+	P(fairamp_balance_cpu_stop_during_not_balancing);
+	P(fairamp_balance_cpu_stop_task_is_gone);
+	P(fairamp_balance_cpu_stop_cannot_migrate_task);
+	P(fairamp_balance_cpu_stop_succeed);
+	P(fairamp_balance_cpu_stop_already_while_double_locking);
+	P(fairamp_balance_cpu_stop_succeed_to_migrate_that_task);
+#endif
+
+#ifdef CONFIG_FAIRAMP_FAST_CORE_FIRST
+	P(fairamp_balance_fast_core_first);
+	P(fairamp_balance_fast_core_first_lagged_task);
+	P(fairamp_balance_fast_core_first_no_migratable_task);
+	P(fairamp_balance_fast_core_first_passive);
+	P(fairamp_balance_fast_core_first_active);
+	P(fairamp_balance_fast_core_first_no_candidate);
+	P(fairamp_balance_fast_core_balancing_give_up);
+	P(fairamp_balance_fast_core_balancing_try);
+	P(fairamp_balance_fast_core_balancing_succeed);
+	
+	/* related to fast_core_first_cpu_stop */
+	P(fairamp_fast_core_first_cpu_stop_called);
+	P(fairamp_fast_core_first_cpu_stop_during_not_balancing);
+	P(fairamp_fast_core_first_cpu_stop_no_migratable_task);
+	P(fairamp_fast_core_first_cpu_stop_succeed);
+	
+	/* in load_balance() */	
+	P(load_balance_give_up_fast_to_slow_active_balance);
+#endif	
+#endif
 
 #undef P
 #undef P64

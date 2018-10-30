@@ -72,6 +72,9 @@
 #include <linux/slab.h>
 #include <linux/init_task.h>
 #include <linux/binfmts.h>
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+#include <linux/oprofile.h>
+#endif
 
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
@@ -87,6 +90,15 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
+
+#ifndef fdbg
+/* refer to pr_devel() in include/linux/printk.h */
+#ifdef CONFIG_FAIRAMP_DEBUG
+#define fdbg(fmt, ...) printk(KERN_ERR fmt, ##__VA_ARGS__)
+#else
+#define fdbg(fmt, ...) no_printk(KERN_ERR fmt, ##__VA_ARGS__)
+#endif /* CONFIG_FAIRAMP_DEBUG */
+#endif /* fdbg */
 
 void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
 {
@@ -124,6 +136,66 @@ void update_rq_clock(struct rq *rq)
 	rq->clock += delta;
 	update_rq_clock_task(rq, delta);
 }
+
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+static void __update_rq_max_lagged(struct rq *rq) {
+	int max_lagged = 0;
+	struct task_struct *max_lagged_task = NULL;
+	struct task_struct *pos;
+
+	if (rq->is_fast) {
+		list_for_each_entry(pos, &rq->cfs_tasks, se.group_node) {
+			if (pos->se.lagged > max_lagged) {
+				max_lagged = pos->se.lagged;
+				max_lagged_task = pos; 
+			}
+		}
+	} else { /* rq->is_fast == 0 */
+		list_for_each_entry(pos, &rq->cfs_tasks, se.group_node) {
+			if (pos->se.lagged < max_lagged) {
+				max_lagged = pos->se.lagged;
+				max_lagged_task = pos; 
+			}
+		}
+	}
+
+	rq->max_lagged = max_lagged;
+	rq->max_lagged_task = max_lagged_task;
+}
+
+/* flag == 1 if enqueue or update
+ * flag == 0 if dequeue
+ */
+void update_rq_max_lagged(struct rq *rq, struct task_struct *p, int lagged, int flag) {
+	BUG_ON(p == NULL);
+
+	if (p->se.unit_fast_vruntime == 0 && p->se.unit_slow_vruntime == 0) /* ignore this task */
+		return;
+
+	if(flag == 1
+			&& p->state != TASK_RUNNING 
+			&& p->state != TASK_WAKING 
+			&& !(task_thread_info(p)->preempt_count & PREEMPT_ACTIVE)) {
+		flag = 0; /* this will be dequeued */
+	}
+
+	if (flag == 0) { /* case: dequeue */
+		if (rq->max_lagged_task == p)
+			__update_rq_max_lagged(rq);
+		return;
+	}
+
+	/* case: enqueue or update */
+	if ((rq->is_fast && lagged > rq->max_lagged)
+			|| (!rq->is_fast && lagged < rq->max_lagged)) {
+		rq->max_lagged = lagged;
+		rq->max_lagged_task = p;
+	} else if (rq->max_lagged_task == p
+				&& rq->max_lagged != lagged) {
+		__update_rq_max_lagged(rq);
+	}
+}
+#endif /* CONFIG_FAIRAMP_DO_SCHED */
 
 /*
  * Debugging: various feature bits
@@ -1519,10 +1591,32 @@ static void __sched_fork(struct task_struct *p)
 	p->se.on_rq			= 0;
 	p->se.exec_start		= 0;
 	p->se.sum_exec_runtime		= 0;
-	p->se.prev_sum_exec_runtime	= 0;
-	p->se.nr_migrations		= 0;
 	p->se.vruntime			= 0;
+	p->se.prev_sum_exec_runtime	= 0;
+#ifdef CONFIG_FAIRAMP
+	p->se.sum_fast_exec_runtime			= 0;
+	p->se.sum_slow_exec_runtime			= 0;
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+	p->se.fast_vruntime			= 0;
+	p->se.slow_vruntime			= 0;
+	if (current) {
+		struct task_struct *curr = current;
+		p->se.unit_fast_vruntime = curr->se.unit_fast_vruntime;
+		p->se.unit_slow_vruntime = curr->se.unit_slow_vruntime;
+	} else {
+		p->se.unit_fast_vruntime	= 0;
+		p->se.unit_slow_vruntime	= 0;
+	}
+	p->se.fast_round			= 0;
+	p->se.slow_round			= 0;
+	p->se.lagged				= 0;
+#endif /* CONFIG_FAIRAMP_DO_SCHED */
+	p->se.sum_fast_exec_runtime_mprev	= 0;
+	p->se.sum_slow_exec_runtime_mprev	= 0;
+#endif /* CONFIG_FAIRAMP */
+	p->se.nr_migrations		= 0;
 	INIT_LIST_HEAD(&p->se.group_node);
+
 
 #ifdef CONFIG_SCHEDSTATS
 	memset(&p->se.statistics, 0, sizeof(p->se.statistics));
@@ -1532,6 +1626,13 @@ static void __sched_fork(struct task_struct *p)
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	INIT_HLIST_HEAD(&p->preempt_notifiers);
+#endif
+
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+	atomic64_set(&p->insts_fast, 0);
+	atomic_set(&p->insts_fast_ovf, 0);
+	atomic64_set(&p->insts_slow, 0);
+	atomic_set(&p->insts_slow_ovf, 0);
 #endif
 }
 
@@ -1853,6 +1954,11 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	       struct task_struct *next)
 {
 	struct mm_struct *mm, *oldmm;
+
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+	if (measuring_IPS_type_started)
+		update_cpu_IPS_type(NULL);
+#endif
 
 	prepare_task_switch(rq, prev, next);
 
@@ -2774,6 +2880,10 @@ pick_next_task(struct rq *rq)
 	BUG(); /* the idle class will always have a runnable task */
 }
 
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+int is_lagged(int lagged, struct rq *rq);
+#endif
+
 /*
  * __schedule() is the main scheduler function.
  *
@@ -2857,6 +2967,13 @@ need_resched:
 	}
 
 	pre_schedule(rq, prev);
+
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+	if (rq->is_fast) {
+		if (unlikely((!rq->nr_running || is_lagged(rq->max_lagged, rq)) && !rq->active_balance))
+			fairamp_balance(cpu, rq);
+	}
+#endif
 
 	if (unlikely(!rq->nr_running))
 		idle_balance(cpu, rq);
@@ -4020,6 +4137,20 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 	get_task_struct(p);
 	rcu_read_unlock();
 
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+	if (p->se.unit_fast_vruntime > 0 &&
+			cpumask_intersects(in_mask, cpu_fast_mask) == 0) {
+		retval = -EPERM;
+		goto out_put_task;
+	}
+
+	if (p->se.unit_slow_vruntime > 0 &&
+			cpumask_intersectsnot(in_mask, cpu_fast_mask) == 0) {
+		retval = -EPERM;
+		goto out_put_task;
+	}
+#endif
+
 	if (!alloc_cpumask_var(&cpus_allowed, GFP_KERNEL)) {
 		retval = -ENOMEM;
 		goto out_put_task;
@@ -4185,6 +4316,491 @@ SYSCALL_DEFINE0(sched_yield)
 
 	return 0;
 }
+
+#ifdef CONFIG_FAIRAMP
+static int
+do_set_core_type(int cpu, bool fast)
+{
+	fdbg("[SET TYPE] cpu: %d -> %s", cpu, fast ? "fast" : "slow");
+	
+	/* error checking */
+	if (cpu >= nr_cpu_ids || cpu < 0
+			|| !cpu_online(cpu)) {
+		fdbg("[SET TYPE] cpu: %d -> %s ==> failed\n", cpu, fast ? "fast" : "slow");
+		return -ENXIO;
+	}
+		
+	/* already set as you want. */
+	if (cpu_fast(cpu) == fast) {
+		fdbg("[SET TYPE] cpu: %d -> %s ==> already\n", cpu, fast ? "fast" : "slow");
+		return 0;
+	}
+
+	/* set the fast core mask and rq->is_fast */
+	set_cpu_fast(cpu, fast);
+	cpu_rq(cpu)->is_fast = fast;
+	wmb();
+	fdbg("[SET TYPE] cpu: %d -> %s ==> succeed\n", cpu, fast ? "fast" : "slow");
+
+	return 0;
+}
+
+#define NUM_MAX_BENCH (NR_CPUS*2)
+static struct task_struct *fairamp_tasks[NUM_MAX_BENCH];
+
+static struct task_struct *get_fairamp_task(int id, pid_t pid) {
+	struct task_struct *p = NULL;
+
+	if (likely(id >= 0 && id < NUM_MAX_BENCH)) { /* cachable */
+		if (fairamp_tasks[id] 
+				&& fairamp_tasks[id]->pid == pid) { /* cached */
+			p = fairamp_tasks[id];
+		} else { /* not cached => cache it! */
+			p = find_process_by_pid(pid);
+			fairamp_tasks[id] = p;
+		}
+	} else {
+		p = find_process_by_pid(pid);
+	}
+
+	return p;
+}
+
+void dealloc_fairamp_tasks(struct task_struct *p)
+{
+	int i;
+	if (p->sched_class != &fair_sched_class)
+		return;
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+	if (p->se.unit_fast_vruntime == 0 && p->se.unit_slow_vruntime == 0)
+		return;
+#endif
+
+	for (i = 0; i < NUM_MAX_BENCH; i++) {
+		if (fairamp_tasks[i] == p) {
+			fairamp_tasks[i] = NULL;
+			break;
+		}
+	}
+}
+
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+struct fairamp_unit_vruntime {
+	int num;
+	pid_t pid;
+	u32 unit_fast_vruntime;
+	u32 unit_slow_vruntime;
+};
+
+static void 
+__do_set_unit_vruntime(struct task_struct *p, 
+					u32 unit_fast_vruntime, u32 unit_slow_vruntime)
+{
+	struct task_struct *t = p;
+	struct sched_entity *se;
+	unsigned long flags;
+	struct rq *rq;
+	int on_rq;
+	struct task_struct *pos;
+	fdbg("[%s] starts pid: %d fast_unit: %d slow_unit: %d\n", __func__, 
+			p->pid, unit_fast_vruntime, unit_slow_vruntime);
+
+	do {
+		se = &t->se;
+		fdbg("[%s] do pid: %d fast_unit: %d slow_unit: %d \n", __func__, 
+				t->pid, unit_fast_vruntime, unit_slow_vruntime);
+
+		/* if already adjusted as you want, return early and prevent the initialization */
+		if (se->lagged < 10 && se->lagged > -10 /* if lagged a lot, re-initialize is needed */
+				&& se->unit_fast_vruntime == unit_fast_vruntime
+				&& se->unit_slow_vruntime == unit_slow_vruntime)
+			goto traverse_next_thread; 
+
+		/* We have to be careful. The task might be in the middle of scheduling on another CPU. */
+		/* Ref: kernel/sched/core.c:set_user_nice() */
+		rq = task_rq_lock(t, &flags);
+
+		on_rq = t->on_rq;
+		if (on_rq)
+			dequeue_task(rq, t, 0);
+
+		/* re-initialization */
+		se->fast_round = 0;
+		se->slow_round = 0;
+
+		/* adjust @unit_*_vruntime */ 
+		se->unit_fast_vruntime = unit_fast_vruntime;
+		se->unit_slow_vruntime = unit_slow_vruntime;
+		
+		/* adjust @lagged */
+		if (unit_fast_vruntime == 0 && unit_slow_vruntime > 0)
+			se->lagged = INT_MAX; /* prevent scheduling on fast cores */
+		else if (unit_fast_vruntime > 0 && unit_slow_vruntime == 0)
+			se->lagged = INT_MIN; /* prevent scheduling on slow cores */
+		else
+			se->lagged = 0; /* even if unit_fast_vruntime == 0 && unit_slow_vruntime == 0
+								since this is the case that the task can be scheduled any cpu freely */
+
+		/* check cpu affinity */
+		if ((t->se.unit_fast_vruntime > 0 &&
+					!cpumask_intersects(&t->cpus_allowed, cpu_fast_mask))
+				 ||
+				 (t->se.unit_slow_vruntime > 0 &&
+					!cpumask_intersectsnot(&t->cpus_allowed, cpu_fast_mask))
+			) {
+			/* task_rq_lock is already acquired.
+				Here, we always widen the cpus_allowed.
+				We do not need to migration the thread */
+			do_set_cpus_allowed(t, cpu_online_mask);
+		}
+
+		if (on_rq) {
+			enqueue_task(rq, t, 0);
+
+			/* 
+			 * if the task is running and 
+			 * it has not to run on the currently running cpu,
+			 * then rescheduling its CPU
+			 */
+			if (task_running(rq, t)) {
+				if ((se->lagged == INT_MIN && rq->is_fast)
+						|| (se->lagged == INT_MAX && !rq->is_fast))
+					resched_task(rq->curr);
+			}
+		}
+
+		task_rq_unlock(rq, t, &flags);
+
+traverse_next_thread:
+		if (!list_empty(&t->children)) {
+			/* traverse children */
+			list_for_each_entry_rcu(pos, &t->children, sibling) {
+				get_task_struct(pos);
+				__do_set_unit_vruntime(pos, unit_fast_vruntime, unit_slow_vruntime);
+				put_task_struct(pos);
+			}
+		}
+	} while_each_thread(p, t);
+	fdbg("[%s] ends\n", __func__);
+}
+
+/* rcu_read_lock should be held in caller */
+static int _do_set_unit_vruntime(struct fairamp_unit_vruntime *info)
+{
+	struct task_struct *p = get_fairamp_task(info->num, info->pid);
+	if (p == NULL)
+		return -ESRCH;
+	
+	fdbg("[%s] comm: %s\n", __func__, p->comm);
+	__do_set_unit_vruntime(p, info->unit_fast_vruntime, info->unit_slow_vruntime);
+	fdbg("[%s] ends\n", __func__);
+
+	return 0;
+}
+
+static int do_set_unit_vruntime(u32 num, void __user * vars)
+{
+	struct fairamp_unit_vruntime info[num];
+	int i;
+	int err;
+	int success = 0;
+	fdbg("[%s] starts num: %d vars: %p\n", __func__, num, vars);
+	
+	if (unlikely(num == 0))
+		return 0;
+
+	if (copy_from_user(info, vars, sizeof(struct fairamp_unit_vruntime) * num))
+		return -EFAULT;
+	
+	preempt_disable();
+	fdbg("[%s] preemt_disabled\n", __func__);
+
+	if (num == 1 && info[0].pid == 0) {
+		__do_set_unit_vruntime(current, info[0].unit_fast_vruntime, info[0].unit_slow_vruntime);
+		success++;
+		goto out;
+	}
+
+	rcu_read_lock();
+	for (i = 0; i < num; i++) {
+		if (info[i].pid == 0)
+			continue;
+		err = _do_set_unit_vruntime(&info[i]);
+		if (!err)
+			success++;
+		else
+			fdbg("[%s] fail pid: %5d err: %2d\n", __func__, info[i].pid, err);
+	}
+	rcu_read_unlock();
+
+out:
+	preempt_enable();
+	fdbg("[%s] end preemt_enabled success: %d\n", __func__, success);
+	return success;
+}
+#endif /* CONFIG_FAIRAMP_DO_SCHED */
+
+struct fairamp_threads_info {
+	int num;
+	pid_t pid;
+	long long insts_fast;
+	long long insts_slow;
+	unsigned long long sum_fast_exec_runtime;
+	unsigned long long sum_slow_exec_runtime;
+	int err;
+};
+
+static int __do_get_threads_info_current_only(struct fairamp_threads_info *info)
+{
+	u64 temp;
+	struct task_struct *t = current;
+	
+	if (t == NULL)
+		return -ESRCH;
+	
+	info->insts_fast = 0;
+	info->insts_slow = 0;
+	info->sum_fast_exec_runtime = 0;
+	info->sum_slow_exec_runtime = 0;
+
+	fdbg("[%s] info.pid: %5d t.pid: %5d t.comm: %20s fast_exec: %16lld slow_exec: %16lld\n",
+			__func__, info->pid, t->pid, t->comm, 
+			t->se.sum_fast_exec_runtime, t->se.sum_slow_exec_runtime);
+
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+	/* no need to lock, since @insts_* are atomic64_t and @sum_*_runtime is only read. */
+	info->insts_fast += atomic64_xchg(&t->insts_fast, 0);
+	info->insts_slow += atomic64_xchg(&t->insts_slow, 0);
+#endif
+
+	temp = t->se.sum_fast_exec_runtime;
+	info->sum_fast_exec_runtime += temp - t->se.sum_fast_exec_runtime_mprev;
+	t->se.sum_fast_exec_runtime_mprev = temp;
+	temp = t->se.sum_slow_exec_runtime;
+	info->sum_slow_exec_runtime += temp - t->se.sum_slow_exec_runtime_mprev;
+	t->se.sum_slow_exec_runtime_mprev = temp;
+
+	return 0;
+}
+
+static void 
+__do_get_threads_info(struct task_struct *p, 
+					struct fairamp_threads_info *info, int depth)
+{
+	u64 temp;
+	struct task_struct *t = p;
+	struct task_struct *pos;
+	int init_tid = 0;
+
+	do {
+		get_task_struct(t);
+		/* to prevent infinite loop */
+		if (unlikely(init_tid == 0))
+			init_tid = t->pid;
+		else if (unlikely(init_tid == t->pid)) {
+			put_task_struct(t);
+			return;
+		}
+
+		fdbg("[%s] info.pid: %5d t.pid: %5d t.comm: %20s"
+			 " fast_exec: %16lld slow_exec: %16lld depth: %d\n", 
+			 __func__, info->pid, t->pid, t->comm, 
+			 t->se.sum_fast_exec_runtime, t->se.sum_slow_exec_runtime, depth);
+
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+		/* no need to lock, since @insts_* are atomic64_t and @sum_*_runtime is only read. */
+		info->insts_fast += atomic64_xchg(&t->insts_fast, 0);
+		info->insts_slow += atomic64_xchg(&t->insts_slow, 0);
+#endif
+
+		temp = t->se.sum_fast_exec_runtime;
+		info->sum_fast_exec_runtime += temp - t->se.sum_fast_exec_runtime_mprev;
+		t->se.sum_fast_exec_runtime_mprev = temp;
+		temp = t->se.sum_slow_exec_runtime;
+		info->sum_slow_exec_runtime += temp - t->se.sum_slow_exec_runtime_mprev;
+		t->se.sum_slow_exec_runtime_mprev = temp;
+
+		if (!list_empty(&t->children)) {
+			int init_child_tid = 0;
+			/* traverse children */
+			list_for_each_entry_rcu(pos, &t->children, sibling) {
+				get_task_struct(pos);
+				/* to prevent infinite loop */
+				if (unlikely(init_child_tid == 0))
+					init_child_tid = pos->pid;
+				else if (unlikely(init_child_tid == pos->pid)) {
+					put_task_struct(pos);
+					put_task_struct(t);
+					return;
+				}
+				__do_get_threads_info(pos, info, depth + 1);
+				put_task_struct(pos);
+			}
+		}
+		put_task_struct(t);
+	} while_each_thread(p, t);
+}
+
+/* rcu_read_lock should be held in caller */
+static int _do_get_threads_info(struct fairamp_threads_info *info)
+{
+	struct task_struct *p = get_fairamp_task(info->num, info->pid);
+
+	if (p == NULL)
+		return -ESRCH;
+	get_task_struct(p);
+	info->insts_fast = 0;
+	info->insts_slow = 0;
+	info->sum_fast_exec_runtime = 0;
+	info->sum_slow_exec_runtime = 0;
+
+	__do_get_threads_info(p, info, 0);
+	put_task_struct(p);
+	return 0;
+}
+
+static int do_get_threads_info(u64 num, void __user * __info)
+{
+	struct fairamp_threads_info info[num];
+	int i;
+	int success = 0;
+	
+	if (unlikely(num == 0))
+		return 0;
+
+	if (copy_from_user(info, __info, sizeof(struct fairamp_threads_info) * num))
+		return -EFAULT;
+	
+	preempt_disable();
+	local_irq_disable();
+
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+	/* update performance counter and timer things */
+	update_IPS_type();
+#else
+	/* updating timer things is enough */
+	on_each_cpu(update_cpu_time_type, NULL, true);
+#endif
+	
+	if (num == 1 && info[0].pid == 0) {
+		__do_get_threads_info_current_only(&info[0]);
+		success++;
+		goto out;
+	}
+
+	rcu_read_lock();	
+	for (i = 0; i < num; i++) {
+		if (info[i].pid == 0)
+			continue;
+		info[i].err = _do_get_threads_info(&info[i]);
+		if (info[i].err == 0)
+			success++;
+		else
+			fdbg("[%s] fail pid: %5d err: %2d\n", __func__, info[i].pid, info[i].err);
+	}
+	rcu_read_unlock();
+	
+out:
+	local_irq_enable();
+	preempt_enable();
+
+	if (copy_to_user(__info, info, sizeof(struct fairamp_threads_info) * num))
+		success = -EFAULT;
+
+	return success;
+}
+
+static int do_core_pinning(int cpu, u32 pid)
+{
+	/* find_process_by_pid returns current if pid == 0 */
+	struct task_struct *p = find_process_by_pid(pid);
+
+	if (unlikely(cpu < 0 || cpu >= nr_cpu_ids))
+		return -EINVAL;
+	
+	if (unlikely(!cpu_online(cpu)))
+		return -EINVAL;
+
+	return set_cpus_allowed_ptr(p, cpumask_of(cpu));
+}
+
+
+/* Definition of operations of fairamp system call */
+#define SET_FAST_CORE               0
+#define SET_SLOW_CORE               1
+#define SET_UNIT_VRUNTIME	        2
+#define GET_THREADS_INFO            3
+#define START_MEASURING_IPS_TYPE    4
+#define STOP_MEASURING_IPS_TYPE     5
+#define CORE_PINNING                6
+
+/**
+ * sys_fairamp - set/change the fairamp related things
+ * @op: the operation id
+ * @id: cpu id or pid, mostly
+ * @num: a number, e.g., unit_vruntime
+ * @vars: a user space pointer for large parameter
+ */
+SYSCALL_DEFINE4(fairamp, int, op, int, id, u32, num, void __user *, vars)
+{
+	fdbg("[SYS_FAIRAMP] op: %d id: %d num: %d\n", op, id, num); 
+	
+	switch(op) {
+	case SET_FAST_CORE:
+	case SET_SLOW_CORE:
+		/* id: cpu id */
+		if (unlikely(num != 0 || vars != NULL))
+			return -EINVAL;
+		return do_set_core_type(id, op == SET_FAST_CORE);
+#ifdef CONFIG_FAIRAMP_DO_SCHED	
+	case SET_UNIT_VRUNTIME:
+		/* num: the number of entries in @vars
+		   vars: a pointer to an array of structres,
+		   			pid_t pid, u32 unit_fast_vruntime, u32 unit_slow_vruntime
+		 */
+		if (unlikely(id != 0))
+			return -EINVAL;
+		return do_set_unit_vruntime(num, vars);
+#endif
+	case GET_THREADS_INFO:
+		/* num: the number of entries in @vars
+		   vars: a pointer to an array of struct fairamp_threads_info
+		 */
+		if (unlikely(id != 0))
+			return -EINVAL;
+		return do_get_threads_info(num, vars);
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+	case START_MEASURING_IPS_TYPE:
+		/* all arguments should be 0 or NULL */
+		if (unlikely(id != 0 || num != 0 || vars != NULL))
+			return -EINVAL;
+		return do_start_measuring_IPS_type();
+	
+	case STOP_MEASURING_IPS_TYPE:
+		/* all arguments should be 0 or NULL */
+		if (unlikely(id != 0 || num != 0 || vars != NULL))
+			return -EINVAL;
+		return do_stop_measuring_IPS_type();
+#endif
+	case CORE_PINNING:
+		/* id: the id of core the application pinned
+		   num: pid of the application. 0 if the application itself call this 
+		 */
+		if (unlikely(vars != NULL))
+			return -EINVAL;
+		return do_core_pinning(id, num);
+	
+	default: /* invalid operation */
+		return -EINVAL;
+	}
+}
+#else /* !CONFIG_FAIRAMP */
+SYSCALL_DEFINE4(fairamp, int, op, int, id, u32, num, void __user *, vars)
+{
+	return -EINVAL; /* invalid syscall */
+}
+#endif /* !CONFIG_FAIRAMP */
+
 
 static inline int should_resched(void)
 {
@@ -6850,6 +7466,11 @@ void __init sched_init(void)
 			rq->cpu_load[j] = 0;
 
 		rq->last_load_update_tick = jiffies;
+
+#ifdef CONFIG_FAIRAMP
+		rq->is_fast = 0;
+		set_cpu_slow(i, true);
+#endif
 
 #ifdef CONFIG_SMP
 		rq->sd = NULL;

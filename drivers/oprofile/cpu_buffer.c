@@ -334,6 +334,16 @@ void oprofile_add_sample(struct pt_regs * const regs, unsigned long event)
 	int is_kernel;
 	unsigned long pc;
 
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+	if (measuring_IPS_type_started && event == 0) {
+		if (per_cpu(pmu_ovf_lock, smp_processor_id()) == 1)
+			return; /* while update_cpu_IPS_type(), treat the overflow by itself */
+		if (likely(regs))
+			atomic_inc(cpu_fast(smp_processor_id()) ? &current->insts_fast_ovf : &current->insts_slow_ovf);
+		return;
+	}
+#endif /* CONFIG_FAIRAMP_MEASURING_IPS */
+
 	if (likely(regs)) {
 		is_kernel = !user_mode(regs);
 		pc = profile_pc(regs);

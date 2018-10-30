@@ -827,6 +827,8 @@ asmlinkage long sys_fanotify_mark(int fanotify_fd, unsigned int flags,
 				  const char  __user *pathname);
 asmlinkage long sys_syncfs(int fd);
 
+asmlinkage long sys_fairamp(int op, int id, u32 num, void __user *vars);
+
 #ifndef CONFIG_GENERIC_KERNEL_EXECVE
 int kernel_execve(const char *filename, const char *const argv[], const char *const envp[]);
 #else

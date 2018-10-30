@@ -23,13 +23,26 @@
 #include <asm/nmi.h>
 #include <asm/msr.h>
 #include <asm/apic.h>
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+#include <linux/sched.h>
+#endif
 
 #include "op_counter.h"
 #include "op_x86_model.h"
 
+/* refer to pr_devel() in include/linux/printk.h */
+#ifdef CONFIG_FAIRAMP_DEBUG
+#define fdbg(fmt, ...) printk(KERN_ERR fmt, ##__VA_ARGS__)
+#else
+#define fdbg(fmt, ...) no_printk(KERN_ERR fmt, ##__VA_ARGS__)
+#endif /* CONFIG_FAIRAMP_DEBUG */
+
 static struct op_x86_model_spec *model;
 static DEFINE_PER_CPU(struct op_msrs, cpu_msrs);
 static DEFINE_PER_CPU(unsigned long, saved_lvtpc);
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+DEFINE_PER_CPU(int, pmu_ovf_lock); /* while pmu_ovf_lock is 1, do not treat overflow */
+#endif
 
 /* must be protected with get_online_cpus()/put_online_cpus(): */
 static int nmi_enabled;
@@ -789,3 +802,117 @@ void op_nmi_exit(void)
 {
 	exit_suspend_resume();
 }
+
+#ifdef CONFIG_FAIRAMP_MEASURING_IPS
+int measuring_IPS_type_started __read_mostly = 0;
+static int m_inst_idx = 0;
+static unsigned long msr_perfctr_addr = 0;
+
+int do_start_measuring_IPS_type(void) {
+	int err;
+	int idx;
+	if (measuring_IPS_type_started == 1) {
+		printk(KERN_ERR "%s: already started\n", __func__);
+		return -1;
+	}
+
+	for (idx = 0; idx < model->num_counters; idx++) {
+		if (avail_to_resrv_perfctr_nmi_bit(op_x86_virt_to_phys(idx)))
+			break;
+	}
+
+	if (idx == model->num_counters) {
+		printk(KERN_ERR "%s: no pmu available among %d counters\n", __func__, model->num_counters);
+		return -1;
+	}
+	
+	memset(counter_config, 0, OP_MAX_COUNTER * sizeof(struct op_counter_config));
+
+	m_inst_idx = idx;
+	counter_config[m_inst_idx].event = M_INST_EVENT;
+	counter_config[m_inst_idx].unit_mask = M_INST_UNIT_MASK;
+	counter_config[m_inst_idx].count = M_INST_THRESHOLD;
+	counter_config[m_inst_idx].enabled = 1;
+	counter_config[m_inst_idx].kernel = 1;
+	counter_config[m_inst_idx].user = 1;
+
+	err = nmi_setup();
+	if (err)
+		return err;
+	err = nmi_start(); /* always return 0 */
+	msr_perfctr_addr = per_cpu(cpu_msrs, 0).counters[m_inst_idx].addr;
+	measuring_IPS_type_started = 1;
+	fdbg("%s: succeed on pmu%d\n", __func__, m_inst_idx);
+	return 0;
+}
+
+int do_stop_measuring_IPS_type(void) {
+	if (measuring_IPS_type_started == 0) {
+		printk(KERN_ERR "%s: has not started\n", __func__);
+		return -1;
+	}
+	measuring_IPS_type_started = 0;
+	memset(counter_config, 0, OP_MAX_COUNTER * sizeof(struct op_counter_config));
+	m_inst_idx  = 0;
+	nmi_stop();
+	nmi_shutdown();
+	fdbg("%s: succeed\n", __func__);
+	return 0;
+}
+
+void update_cpu_IPS_type(void *__not_in_cs) {
+	int cpu = smp_processor_id();
+	int is_fast = cpu_fast(cpu);
+	long not_in_cs = (long) __not_in_cs;
+	u64 val;
+	long insts;
+	int ovf;
+	struct task_struct *p = current;
+
+	preempt_disable();
+
+#ifdef CONFIG_FAIRAMP_DO_SCHED
+	if (p->se.unit_fast_vruntime == 0 &&
+		p->se.unit_slow_vruntime == 0) {
+		preempt_enable();
+		return;
+	}
+#endif /* CONFIG_FAIRAMP_DO_SCHED */
+
+	/* locking for irq_disable()-free implementation */
+	per_cpu(pmu_ovf_lock, cpu) = 1;	
+	rdmsrl(msr_perfctr_addr, val);
+	ovf = atomic_xchg(is_fast ? &p->insts_fast_ovf : &p->insts_slow_ovf, 0);
+	/* reset the counter value for the next task or the next interval */
+	wrmsrl(msr_perfctr_addr, -(u64)M_INST_THRESHOLD);
+	per_cpu(pmu_ovf_lock, cpu) = 0;	
+
+#define OP_CTR_OVERFLOW			(1ULL<<31) /* same for op_model_amd.c and op_model_x86.c */
+	/* Note that @val is likely to be less than zero
+	 * since it is reset when overflowed 
+	 * That is, insts = M_INST_THRESHOLD - val 
+	 * When overflowed during locked phase, 
+	 * we ignore the overflowed amount of instructions,
+	 * and insts = M_INST_THRESHOLD */ 
+	if (likely(val & OP_CTR_OVERFLOW)) /* bit is clear if overflowed: */
+		insts = val | 0xffffffff00000000; /* signed extension to long type */
+	else
+		insts = 0;
+	insts += M_INST_THRESHOLD;
+	insts += M_INST_THRESHOLD * ovf; /* overflowed values */
+
+	atomic64_add(insts, is_fast ? &p->insts_fast : &p->insts_slow);
+
+	if (not_in_cs) { /* if not called by context_switch() */
+		update_cpu_time_type(NULL); /* in context_switch(), time information is already updated */
+	}
+	preempt_enable();
+}
+
+void update_IPS_type(void) {
+	if (measuring_IPS_type_started == 0)
+		return;
+	
+	on_each_cpu(update_cpu_IPS_type, (void *) 1, true);
+}
+#endif
